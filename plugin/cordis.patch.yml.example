@@ -1,0 +1,15 @@
+# dsh-telegram-notify bundle patch (template)
+# Copy to cordis.patch.yml or let install.ps1 generate it.
+- insert:
+    - id: dsh-telegram-notify
+      name: dsh-telegram-notify
+      config:
+        token: "YOUR_BOT_TOKEN"
+        chatId: "YOUR_CHAT_ID"
+        proxy: "http://127.0.0.1:7897"
+        chatEnabled: true
+        telegramApproval: true
+        notifyApproval: true
+        notifyComplete: true
+        notifyError: true
+        notifyProgress: false
