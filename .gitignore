@@ -1,0 +1,12 @@
+# DSH / runtime
+node_modules/
+.npm-cache/
+*.log
+
+# Secrets
+**/cordis.patch.yml
+!**/cordis.patch.yml.example
+
+# OS
+Thumbs.db
+.DS_Store
