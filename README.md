@@ -4,7 +4,7 @@
 
 **让 DeepSeek Harness / EAC 通过 Telegram 通知你、陪你聊天、让你远程批准**
 
-![Version](https://img.shields.io/badge/version-0.2.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![DSH](https://img.shields.io/badge/DSH-Plugin-orange)
 ![Telegram](https://img.shields.io/badge/Telegram-Bot-2CA5E0)
@@ -91,7 +91,10 @@ dsh-telegram-notify/
 | 命令 | 说明 |
 |---|---|
 | `/start` / `/help` | 显示帮助 |
+| `/menu` | 打开高级 UI 主菜单 |
 | `/status` | 查看 DSH 当前状态、最近完成/错误 |
+| `/stats` | 今日统计：运行时长、完成任务、工具调用、错误 |
+| `/daily` | 今日日报（也可每天自动推送） |
 | `/notify on/off` | 开关全部 Telegram 通知 |
 | `/notify status` | 查看当前通知开关 |
 | `/token` | 查询 DeepSeek API 余额 |
