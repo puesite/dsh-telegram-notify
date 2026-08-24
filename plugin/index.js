@@ -1,7 +1,14 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import https from 'node:https';
 
 export const name = 'dsh-telegram-notify';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SETTINGS_PATH = join(__dirname, 'settings.json');
 
 const WORK_RE = /(执行|运行|安装|卸载|删除|清理|创建|修改|编辑|移动|复制|重命名|下载|上传|部署|构建|测试|修复|整理|打开|关闭|启动|停止|搜索|查询|克隆|提交|推送|发布|写代码|写个程序|开发|配置|设置|检查|扫描|备份|还原|重启)/i;
 
@@ -47,6 +54,39 @@ export function apply(ctx, config = {}) {
   const startTime = Math.floor(Date.now() / 1000);
   const pendingApprovals = new Map();
 
+  const notify = {
+    complete: config.notifyComplete !== false,
+    error: config.notifyError !== false,
+    approval: config.notifyApproval !== false,
+    progress: config.notifyProgress === true,
+  };
+  const status = {
+    busy: false,
+    task: '',
+    currentTool: '',
+    lastCompletedAt: null,
+    lastError: null,
+    lastCompletedSession: '',
+  };
+
+  const loadSettings = () => {
+    try {
+      if (existsSync(SETTINGS_PATH)) {
+        Object.assign(notify, JSON.parse(readFileSync(SETTINGS_PATH, 'utf8')));
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+  const saveSettings = () => {
+    try {
+      writeFileSync(SETTINGS_PATH, JSON.stringify(notify, null, 2), 'utf8');
+    } catch {
+      /* ignore */
+    }
+  };
+  loadSettings();
+
   const tgRequest = (method, params = {}) => {
     return new Promise((resolve) => {
       const url = `https://api.telegram.org/bot${token}/${method}`;
@@ -87,6 +127,81 @@ export function apply(ctx, config = {}) {
   };
 
   const isWorkRequest = (text) => WORK_RE.test(text);
+
+  const fmtTime = (ts) => {
+    if (!ts) return '从未';
+    const d = new Date(ts);
+    return d.toLocaleString('zh-CN', { hour12: false });
+  };
+
+  const getStatusText = () => {
+    const lines = [];
+    lines.push(status.busy ? '🟡 DSH 正在工作中…' : '🟢 DSH 当前空闲');
+    if (status.task) lines.push(`📋 当前任务：${shortText(status.task, 200)}`);
+    if (status.currentTool) lines.push(`🔧 当前工具：${status.currentTool}`);
+    lines.push(`⏱️ 最近完成：${fmtTime(status.lastCompletedAt)}`);
+    if (status.lastError) lines.push(`❌ 最近错误：${shortText(status.lastError, 200)}`);
+    lines.push(`🔔 通知状态：完成=${notify.complete ? '开' : '关'}，错误=${notify.error ? '开' : '关'}，批准=${notify.approval ? '开' : '关'}，进度=${notify.progress ? '开' : '关'}`);
+    return lines.join('\n');
+  };
+
+  const queryBalance = (apiKey) => {
+    return new Promise((resolve) => {
+      const req = https.request({
+        hostname: 'api.deepseek.com',
+        path: '/user/balance',
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Accept: 'application/json',
+        },
+      }, (res) => {
+        let data = '';
+        res.on('data', (c) => { data += c; });
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch {
+            resolve(null);
+          }
+        });
+      });
+      req.on('error', () => resolve(null));
+      req.end();
+    });
+  };
+
+  const getBalanceText = async () => {
+    const dshHome = process.env.DSH_HOME || join(process.env.USERPROFILE || '', '.dsh');
+    const credPath = join(dshHome, '.credentials.yaml');
+    let apiKey = '';
+    try {
+      const raw = readFileSync(credPath, 'utf8');
+      const m = raw.match(/DEEPSEEK_API_KEY:\s*["']?([^"'\s]+)/);
+      if (m) apiKey = m[1];
+    } catch {
+      apiKey = '';
+    }
+    if (!apiKey) {
+      return '❌ 未找到 DEEPSEEK_API_KEY，请先在 EAC 里配置。';
+    }
+    const data = await queryBalance(apiKey);
+    if (!data) {
+      return '❌ 查询余额失败，可能是网络或 API 问题。';
+    }
+    const infos = Array.isArray(data.balance_infos) ? data.balance_infos : [];
+    if (infos.length === 0) {
+      return `ℹ️ 余额接口已返回，但暂无余额信息。\n可用：${data.is_available ? '是' : '否'}`;
+    }
+    const lines = infos.map((b) => {
+      const cur = b.currency || 'CNY';
+      const total = b.total_balance ?? '?';
+      const granted = b.granted_balance ?? '?';
+      const topped = b.topped_up_balance ?? '?';
+      return `💰 ${cur} 总额：${total}\n  赠送：${granted}\n  充值：${topped}`;
+    });
+    return `📊 DeepSeek 余额\n${lines.join('\n')}\n可用：${data.is_available ? '✅' : '❌'}`;
+  };
 
   async function ensureChatSession() {
     if (apiRef && chatSessionId && chatSessionReady) return chatSessionId;
@@ -147,7 +262,35 @@ export function apply(ctx, config = {}) {
     if (!text) return;
 
     if (text === '/start' || text === '/help' || text === '帮助') {
-      await send('我是 Mocha 喵～\n\n在这里可以和我聊天。\n\n⚠️ 工作请在桌面端 EAC 发布，我不能在 Telegram 里执行工作。\n\n可用命令：\n/new - 开启新对话\n/help - 帮助');
+      await send('我是 Mocha 喵～\n\n在这里可以和我聊天。\n\n⚠️ 工作请在桌面端 EAC 发布，我不能在 Telegram 里执行工作。\n\n可用命令：\n/status - 查看 DSH 状态\n/notify on|off - 开关通知\n/token - 查询 DeepSeek 余额\n/new - 开启新对话\n/help - 帮助');
+      return;
+    }
+
+    if (text === '/status') {
+      await send(getStatusText());
+      return;
+    }
+
+    if (text === '/notify' || text.startsWith('/notify ')) {
+      const arg = text.replace('/notify', '').trim().toLowerCase();
+      if (arg === 'on') {
+        notify.complete = notify.error = notify.approval = notify.progress = true;
+        saveSettings();
+        await send('🔔 已开启全部通知。');
+      } else if (arg === 'off') {
+        notify.complete = notify.error = notify.approval = notify.progress = false;
+        saveSettings();
+        await send('🔕 已关闭全部通知。');
+      } else if (arg === 'status' || arg === '') {
+        await send(`🔔 当前通知状态：\n完成=${notify.complete ? '开' : '关'}\n错误=${notify.error ? '开' : '关'}\n批准=${notify.approval ? '开' : '关'}\n进度=${notify.progress ? '开' : '关'}`);
+      } else {
+        await send('用法：/notify on 或 /notify off 或 /notify status');
+      }
+      return;
+    }
+
+    if (text === '/token') {
+      await send(await getBalanceText());
       return;
     }
 
@@ -255,40 +398,65 @@ export function apply(ctx, config = {}) {
     const sid = sessionIdOf(session);
 
     try {
+      if (event.type === 'turn/start') {
+        status.busy = true;
+        status.currentTool = '';
+        return;
+      }
+
+      if (event.type === 'todo/write') {
+        const todos = Array.isArray(event.data?.todos) ? event.data.todos : [];
+        const current = todos.find(t => t?.status === 'in_progress') || todos.find(t => t?.status === 'pending');
+        if (current?.content) status.task = String(current.content);
+        if (notify.progress) {
+          const done = todos.filter(t => t?.status === 'completed').length;
+          const total = todos.length;
+          sendSoon(`📋 进度更新：${done}/${total}\n\n${sid ? `会话：${sid}` : ''}`);
+        }
+        return;
+      }
+
+      if (event.type === 'tool/call') {
+        status.currentTool = event.data?.name ?? event.data?.tool ?? 'tool';
+        return;
+      }
+
       if (event.type === 'turn/end' && sid === chatSessionId && chatBusy) {
+        status.busy = false;
+        status.lastCompletedAt = Date.now();
         void sendChatReply();
         return;
       }
 
-      if (event.type === 'approval/asked' && config.notifyApproval !== false && !telegramApproval) {
+      if (event.type === 'approval/asked' && notify.approval && !telegramApproval) {
         const data = event.data || {};
         const detail = shortText(data.detail ?? data.reason ?? data.description ?? data.text ?? '');
         sendSoon(`🔔 需要你批准\n\n${sid ? `会话：${sid}\n` : ''}${detail ? `详情：${detail}` : '有一条新的批准请求'}`);
         return;
       }
 
-      if (event.type === 'turn/end' && config.notifyComplete !== false) {
-        if (sid === chatSessionId) return;
-        const data = event.data || {};
-        const reason = data.reason ? `（${data.reason}）` : '';
-        sendSoon(`✅ 工作完成${reason}\n\n${sid ? `会话：${sid}` : ''}`);
-        return;
-      }
-
-      if (event.type === 'tool/result' && event.data?.error && config.notifyError !== false) {
+      if (event.type === 'tool/result' && event.data?.error) {
         const err = event.data.error;
         const code = err?.code ? ` [${err.code}]` : '';
         const message = err?.message ?? err?.text ?? shortText(err);
         const tool = event.data?.name ?? event.data?.tool ?? 'tool';
-        sendSoon(`❌ 工具出错${code}\n\n工具：${tool}\n错误：${message}\n${sid ? `会话：${sid}` : ''}`);
+        status.lastError = `${tool}: ${message}`;
+        if (notify.error) {
+          sendSoon(`❌ 工具出错${code}\n\n工具：${tool}\n错误：${message}\n${sid ? `会话：${sid}` : ''}`);
+        }
         return;
       }
 
-      if (event.type === 'todo/write' && config.notifyProgress === true) {
-        const todos = Array.isArray(event.data?.todos) ? event.data.todos : [];
-        const done = todos.filter(t => t?.status === 'completed').length;
-        const total = todos.length;
-        sendSoon(`📋 进度更新：${done}/${total}\n\n${sid ? `会话：${sid}` : ''}`);
+      if (event.type === 'turn/end') {
+        status.busy = false;
+        status.lastCompletedAt = Date.now();
+        status.lastCompletedSession = sid;
+        if (sid === chatSessionId) return;
+        if (notify.complete) {
+          const data = event.data || {};
+          const reason = data.reason ? `（${data.reason}）` : '';
+          sendSoon(`✅ 工作完成${reason}\n\n${sid ? `会话：${sid}` : ''}`);
+        }
         return;
       }
     } catch (e) {
