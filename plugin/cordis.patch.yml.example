@@ -9,6 +9,8 @@
         proxy: "http://127.0.0.1:7897"
         chatEnabled: true
         telegramApproval: true
+        dailyReport: true
+        dailyReportTime: "23:30"
         notifyApproval: true
         notifyComplete: true
         notifyError: true
