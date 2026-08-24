@@ -9,6 +9,7 @@ export const name = 'dsh-telegram-notify';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SETTINGS_PATH = join(__dirname, 'settings.json');
+const STATS_PATH = join(__dirname, 'stats.json');
 
 const WORK_RE = /(执行|运行|安装|卸载|删除|清理|创建|修改|编辑|移动|复制|重命名|下载|上传|部署|构建|测试|修复|整理|打开|关闭|启动|停止|搜索|查询|克隆|提交|推送|发布|写代码|写个程序|开发|配置|设置|检查|扫描|备份|还原|重启)/i;
 
@@ -24,6 +25,10 @@ function shortText(v, max = 500) {
   if (v === undefined || v === null) return '';
   const s = typeof v === 'string' ? v : JSON.stringify(v);
   return s.length > max ? s.slice(0, max) + '…' : s;
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function unwrapRpc(res) {
@@ -68,6 +73,44 @@ export function apply(ctx, config = {}) {
     lastError: null,
     lastCompletedSession: '',
   };
+
+  const todayKey = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  };
+  const stats = {
+    date: todayKey(),
+    firstStartedAt: Date.now(),
+    completedTasks: 0,
+    errors: 0,
+    toolCalls: 0,
+    approvals: 0,
+  };
+
+  const loadStats = () => {
+    try {
+      if (existsSync(STATS_PATH)) {
+        const loaded = JSON.parse(readFileSync(STATS_PATH, 'utf8'));
+        if (loaded.date === todayKey()) {
+          Object.assign(stats, loaded);
+        } else {
+          stats.date = todayKey();
+          stats.firstStartedAt = Date.now();
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+  const saveStats = () => {
+    try {
+      writeFileSync(STATS_PATH, JSON.stringify(stats, null, 2), 'utf8');
+    } catch {
+      /* ignore */
+    }
+  };
+  loadStats();
+  saveStats();
 
   const loadSettings = () => {
     try {
@@ -115,12 +158,29 @@ export function apply(ctx, config = {}) {
   };
 
   const send = (text, toChatId = chatId, extra = {}) => {
-    return tgRequest('sendMessage', { chat_id: toChatId, text, ...extra });
+    return tgRequest('sendMessage', { chat_id: toChatId, text, parse_mode: 'HTML', ...extra });
   };
 
   const sendSoon = (text) => {
     void send(text).catch(() => {});
   };
+
+  const dailyReportEnabled = config.dailyReport !== false;
+  const dailyReportTime = config.dailyReportTime || '23:30';
+  let lastDailySentDate = '';
+  const dailyTimer = setInterval(() => {
+    if (!dailyReportEnabled) return;
+    const now = new Date();
+    const today = todayKey();
+    const [h, m] = dailyReportTime.split(':').map(Number);
+    const cur = now.getHours() * 60 + now.getMinutes();
+    const target = (Number.isFinite(h) ? h : 23) * 60 + (Number.isFinite(m) ? m : 30);
+    if (cur >= target && lastDailySentDate !== today) {
+      lastDailySentDate = today;
+      void send(getDailyText());
+    }
+  }, 60000);
+  ctx.effect(() => () => clearInterval(dailyTimer), 'dsh-telegram-notify:daily');
 
   const answerCallback = (callbackId, text) => {
     return tgRequest('answerCallbackQuery', { callback_query_id: callbackId, text });
@@ -134,16 +194,73 @@ export function apply(ctx, config = {}) {
     return d.toLocaleString('zh-CN', { hour12: false });
   };
 
+  const fmtDuration = (ms) => {
+    if (!ms || ms < 0) return '0 分钟';
+    const totalMinutes = Math.floor(ms / 60000);
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (hours > 0) return `${hours} 小时 ${minutes} 分钟`;
+    return `${minutes} 分钟`;
+  };
+
   const getStatusText = () => {
     const lines = [];
-    lines.push(status.busy ? '🟡 DSH 正在工作中…' : '🟢 DSH 当前空闲');
-    if (status.task) lines.push(`📋 当前任务：${shortText(status.task, 200)}`);
-    if (status.currentTool) lines.push(`🔧 当前工具：${status.currentTool}`);
-    lines.push(`⏱️ 最近完成：${fmtTime(status.lastCompletedAt)}`);
-    if (status.lastError) lines.push(`❌ 最近错误：${shortText(status.lastError, 200)}`);
-    lines.push(`🔔 通知状态：完成=${notify.complete ? '开' : '关'}，错误=${notify.error ? '开' : '关'}，批准=${notify.approval ? '开' : '关'}，进度=${notify.progress ? '开' : '关'}`);
+    lines.push(status.busy ? '🟡 <b>DSH 正在工作中…</b>' : '🟢 <b>DSH 当前空闲</b>');
+    if (status.task) lines.push(`📋 当前任务：${esc(shortText(status.task, 200))}`);
+    if (status.currentTool) lines.push(`🔧 当前工具：<code>${esc(status.currentTool)}</code>`);
+    lines.push(`⏱️ 最近完成：<code>${esc(fmtTime(status.lastCompletedAt))}</code>`);
+    if (status.lastError) lines.push(`❌ 最近错误：${esc(shortText(status.lastError, 200))}`);
+    lines.push(`🔔 通知状态：完成=${notify.complete ? '✅' : '❌'}，错误=${notify.error ? '✅' : '❌'}，批准=${notify.approval ? '✅' : '❌'}，进度=${notify.progress ? '✅' : '❌'}`);
     return lines.join('\n');
   };
+
+  const getStatsText = () => {
+    const runMs = Date.now() - (stats.firstStartedAt || Date.now());
+    const lines = [];
+    lines.push('📊 <b>今日统计</b>');
+    lines.push(`📅 日期：<code>${esc(stats.date)}</code>`);
+    lines.push(`⏱️ 今日已运行：<b>${esc(fmtDuration(runMs))}</b>`);
+    lines.push(`✅ 完成任务：<b>${stats.completedTasks}</b>`);
+    lines.push(`🔧 工具调用：<b>${stats.toolCalls}</b>`);
+    lines.push(`❌ 错误次数：<b>${stats.errors}</b>`);
+    lines.push(`🔔 审批请求：<b>${stats.approvals}</b>`);
+    return lines.join('\n');
+  };
+
+  const getDailyText = () => {
+    const lines = [];
+    lines.push('📅 <b>今日日报</b>');
+    lines.push(`📆 日期：<code>${esc(stats.date)}</code>`);
+    lines.push(`⏱️ 今日已运行：<b>${esc(fmtDuration(Date.now() - (stats.firstStartedAt || Date.now())))}</b>`);
+    lines.push(`✅ 完成任务：<b>${stats.completedTasks}</b>`);
+    lines.push(`🔧 工具调用：<b>${stats.toolCalls}</b>`);
+    lines.push(`❌ 错误次数：<b>${stats.errors}</b>`);
+    lines.push(`🔔 审批请求：<b>${stats.approvals}</b>`);
+    lines.push('');
+    lines.push('辛苦啦，今天也继续加油喵～');
+    return lines.join('\n');
+  };
+
+  const getMenuMarkup = () => ({
+    inline_keyboard: [
+      [
+        { text: '📊 状态', callback_data: 'menu:status' },
+        { text: '📈 统计', callback_data: 'menu:stats' },
+      ],
+      [
+        { text: '📅 日报', callback_data: 'menu:daily' },
+        { text: '💰 余额', callback_data: 'menu:token' },
+      ],
+      [
+        { text: '🔔 通知开', callback_data: 'menu:notify-on' },
+        { text: '🔕 通知关', callback_data: 'menu:notify-off' },
+      ],
+      [
+        { text: '🆕 新对话', callback_data: 'menu:new' },
+        { text: '❓ 帮助', callback_data: 'menu:help' },
+      ],
+    ],
+  });
 
   const queryBalance = (apiKey) => {
     return new Promise((resolve) => {
@@ -183,15 +300,15 @@ export function apply(ctx, config = {}) {
       apiKey = '';
     }
     if (!apiKey) {
-      return '❌ 未找到 DEEPSEEK_API_KEY，请先在 EAC 里配置。';
+      return '❌ <b>未找到 DEEPSEEK_API_KEY</b>，请先在 EAC 里配置。';
     }
     const data = await queryBalance(apiKey);
     if (!data) {
-      return '❌ 查询余额失败，可能是网络或 API 问题。';
+      return '❌ <b>查询余额失败</b>，可能是网络或 API 问题。';
     }
     const infos = Array.isArray(data.balance_infos) ? data.balance_infos : [];
     if (infos.length === 0) {
-      return `ℹ️ 余额接口已返回，但暂无余额信息。\n可用：${data.is_available ? '是' : '否'}`;
+      return `ℹ️ 余额接口已返回，但暂无余额信息。\n可用：${data.is_available ? '✅' : '❌'}`;
     }
     const lines = infos.map((b) => {
       const cur = b.currency || 'CNY';
@@ -262,7 +379,16 @@ export function apply(ctx, config = {}) {
     if (!text) return;
 
     if (text === '/start' || text === '/help' || text === '帮助') {
-      await send('我是 Mocha 喵～\n\n在这里可以和我聊天。\n\n⚠️ 工作请在桌面端 EAC 发布，我不能在 Telegram 里执行工作。\n\n可用命令：\n/status - 查看 DSH 状态\n/notify on|off - 开关通知\n/token - 查询 DeepSeek 余额\n/new - 开启新对话\n/help - 帮助');
+      await send(
+        '🐱 <b>Mocha 猫娘助手</b>\n\n在这里可以和我聊天，也可以管理 DSH 通知。\n\n⚠️ 工作请在桌面端 EAC 发布，我不能在 Telegram 里执行工作。\n\n<b>可用命令：</b>\n/status - 查看 DSH 状态\n/stats - 今日统计\n/daily - 今日日报\n/menu - 打开主菜单\n/notify on|off - 开关通知\n/token - 查询 DeepSeek 余额\n/new - 开启新对话\n/help - 帮助',
+        chatId,
+        { reply_markup: getMenuMarkup() }
+      );
+      return;
+    }
+
+    if (text === '/menu') {
+      await send('📱 <b>请选择功能：</b>', chatId, { reply_markup: getMenuMarkup() });
       return;
     }
 
@@ -271,20 +397,30 @@ export function apply(ctx, config = {}) {
       return;
     }
 
+    if (text === '/stats') {
+      await send(getStatsText());
+      return;
+    }
+
+    if (text === '/daily') {
+      await send(getDailyText());
+      return;
+    }
+
     if (text === '/notify' || text.startsWith('/notify ')) {
       const arg = text.replace('/notify', '').trim().toLowerCase();
       if (arg === 'on') {
         notify.complete = notify.error = notify.approval = notify.progress = true;
         saveSettings();
-        await send('🔔 已开启全部通知。');
+        await send('🔔 <b>已开启全部通知。</b>');
       } else if (arg === 'off') {
         notify.complete = notify.error = notify.approval = notify.progress = false;
         saveSettings();
-        await send('🔕 已关闭全部通知。');
+        await send('🔕 <b>已关闭全部通知。</b>');
       } else if (arg === 'status' || arg === '') {
-        await send(`🔔 当前通知状态：\n完成=${notify.complete ? '开' : '关'}\n错误=${notify.error ? '开' : '关'}\n批准=${notify.approval ? '开' : '关'}\n进度=${notify.progress ? '开' : '关'}`);
+        await send(`🔔 <b>当前通知状态：</b>\n完成=${notify.complete ? '✅' : '❌'}\n错误=${notify.error ? '✅' : '❌'}\n批准=${notify.approval ? '✅' : '❌'}\n进度=${notify.progress ? '✅' : '❌'}`);
       } else {
-        await send('用法：/notify on 或 /notify off 或 /notify status');
+        await send('用法：<code>/notify on</code> 或 <code>/notify off</code> 或 <code>/notify status</code>');
       }
       return;
     }
@@ -299,7 +435,7 @@ export function apply(ctx, config = {}) {
       chatSessionReady = false;
       try {
         await ensureChatSession();
-        await send('已开启一段新的聊天～');
+        await send('🆕 <b>已开启一段新的聊天～</b>');
       } catch (e) {
         await send('新对话创建失败：' + (e?.message ?? e));
       }
@@ -353,7 +489,49 @@ export function apply(ctx, config = {}) {
       await answerCallback(cq.id, '无权操作');
       return;
     }
-    const [action, approvalToken] = String(cq.data).split(':');
+    const data = String(cq.data);
+    if (data.startsWith('menu:')) {
+      const key = data.slice(5);
+      if (key === 'status') {
+        await answerCallback(cq.id, '状态');
+        await send(getStatusText(), chatId, { reply_markup: getMenuMarkup() });
+      } else if (key === 'stats') {
+        await answerCallback(cq.id, '统计');
+        await send(getStatsText(), chatId, { reply_markup: getMenuMarkup() });
+      } else if (key === 'daily') {
+        await answerCallback(cq.id, '日报');
+        await send(getDailyText(), chatId, { reply_markup: getMenuMarkup() });
+      } else if (key === 'token') {
+        await answerCallback(cq.id, '余额');
+        await send(await getBalanceText(), chatId, { reply_markup: getMenuMarkup() });
+      } else if (key === 'notify-on') {
+        notify.complete = notify.error = notify.approval = notify.progress = true;
+        saveSettings();
+        await answerCallback(cq.id, '已开启通知');
+        await send('🔔 <b>已开启全部通知。</b>', chatId, { reply_markup: getMenuMarkup() });
+      } else if (key === 'notify-off') {
+        notify.complete = notify.error = notify.approval = notify.progress = false;
+        saveSettings();
+        await answerCallback(cq.id, '已关闭通知');
+        await send('🔕 <b>已关闭全部通知。</b>', chatId, { reply_markup: getMenuMarkup() });
+      } else if (key === 'new') {
+        chatSessionId = `telegram-${chatId}-${Date.now()}`;
+        chatSessionReady = false;
+        await answerCallback(cq.id, '新对话');
+        try {
+          await ensureChatSession();
+          await send('🆕 <b>已开启一段新的聊天～</b>', chatId, { reply_markup: getMenuMarkup() });
+        } catch (e) {
+          await send('新对话创建失败：' + (e?.message ?? e), chatId, { reply_markup: getMenuMarkup() });
+        }
+      } else {
+        await answerCallback(cq.id, '帮助');
+        await send('🐱 <b>Mocha 猫娘助手</b>\n\n/status - 状态\n/stats - 统计\n/daily - 日报\n/notify on|off - 通知\n/token - 余额\n/new - 新对话', chatId, { reply_markup: getMenuMarkup() });
+      }
+      return;
+    }
+
+    const [action, approvalToken] = data.split(':');
     const pending = pendingApprovals.get(approvalToken);
     if (!pending) {
       await answerCallback(cq.id, '请求已过期或已被处理');
@@ -364,7 +542,7 @@ export function apply(ctx, config = {}) {
     const outcome = action === 'approve' ? 'allowed-once' : 'rejected';
     pending.resolve(outcome);
     await answerCallback(cq.id, action === 'approve' ? '✅ 已批准' : '❌ 已拒绝');
-    await send(action === 'approve' ? '✅ 已批准该请求。' : '❌ 已拒绝该请求。');
+    await send(action === 'approve' ? '✅ <b>已批准该请求。</b>' : '❌ <b>已拒绝该请求。</b>');
   }
 
   async function pollTelegram() {
@@ -411,13 +589,15 @@ export function apply(ctx, config = {}) {
         if (notify.progress) {
           const done = todos.filter(t => t?.status === 'completed').length;
           const total = todos.length;
-          sendSoon(`📋 进度更新：${done}/${total}\n\n${sid ? `会话：${sid}` : ''}`);
+          sendSoon(`📋 <b>进度更新：</b>${done}/${total}\n\n${sid ? `会话：<code>${esc(sid)}</code>` : ''}`);
         }
         return;
       }
 
       if (event.type === 'tool/call') {
         status.currentTool = event.data?.name ?? event.data?.tool ?? 'tool';
+        stats.toolCalls += 1;
+        saveStats();
         return;
       }
 
@@ -428,21 +608,27 @@ export function apply(ctx, config = {}) {
         return;
       }
 
-      if (event.type === 'approval/asked' && notify.approval && !telegramApproval) {
-        const data = event.data || {};
-        const detail = shortText(data.detail ?? data.reason ?? data.description ?? data.text ?? '');
-        sendSoon(`🔔 需要你批准\n\n${sid ? `会话：${sid}\n` : ''}${detail ? `详情：${detail}` : '有一条新的批准请求'}`);
+      if (event.type === 'approval/asked') {
+        stats.approvals += 1;
+        saveStats();
+        if (notify.approval && !telegramApproval) {
+          const data = event.data || {};
+          const detail = shortText(data.detail ?? data.reason ?? data.description ?? data.text ?? '');
+          sendSoon(`🔔 <b>需要你批准</b>\n\n${sid ? `会话：<code>${esc(sid)}</code>\n` : ''}${detail ? `详情：${esc(detail)}` : '有一条新的批准请求'}`);
+        }
         return;
       }
 
       if (event.type === 'tool/result' && event.data?.error) {
         const err = event.data.error;
-        const code = err?.code ? ` [${err.code}]` : '';
+        const code = err?.code ? ` [${esc(err.code)}]` : '';
         const message = err?.message ?? err?.text ?? shortText(err);
         const tool = event.data?.name ?? event.data?.tool ?? 'tool';
         status.lastError = `${tool}: ${message}`;
+        stats.errors += 1;
+        saveStats();
         if (notify.error) {
-          sendSoon(`❌ 工具出错${code}\n\n工具：${tool}\n错误：${message}\n${sid ? `会话：${sid}` : ''}`);
+          sendSoon(`❌ <b>工具出错</b>${code}\n\n工具：<code>${esc(tool)}</code>\n错误：${esc(message)}\n${sid ? `会话：<code>${esc(sid)}</code>` : ''}`);
         }
         return;
       }
@@ -452,10 +638,12 @@ export function apply(ctx, config = {}) {
         status.lastCompletedAt = Date.now();
         status.lastCompletedSession = sid;
         if (sid === chatSessionId) return;
+        stats.completedTasks += 1;
+        saveStats();
         if (notify.complete) {
           const data = event.data || {};
-          const reason = data.reason ? `（${data.reason}）` : '';
-          sendSoon(`✅ 工作完成${reason}\n\n${sid ? `会话：${sid}` : ''}`);
+          const reason = data.reason ? `（${esc(data.reason)}）` : '';
+          sendSoon(`✅ <b>工作完成</b>${reason}\n\n${sid ? `会话：<code>${esc(sid)}</code>` : ''}`);
         }
         return;
       }
@@ -473,7 +661,7 @@ export function apply(ctx, config = {}) {
         const approvalToken = randomUUID();
         const reason = req.reason ? `\n理由：${shortText(req.reason, 300)}` : '';
         const tool = req.toolName ? `\n工具：${req.toolName}` : '';
-        const text = `🔔 需要你批准${tool}${reason}\n\n请选择：`;
+        const text = `🔔 <b>需要你批准</b>${tool}${reason}\n\n请选择：`;
         const replyMarkup = {
           inline_keyboard: [[
             { text: '✅ 批准', callback_data: `approve:${approvalToken}` },
@@ -483,7 +671,7 @@ export function apply(ctx, config = {}) {
         const timer = setTimeout(() => {
           if (pendingApprovals.delete(approvalToken)) {
             resolve('rejected');
-            void send('⏰ 批准请求超时，已自动拒绝。');
+            void send('⏰ <b>批准请求超时，已自动拒绝。</b>');
           }
         }, 5 * 60 * 1000);
         pendingApprovals.set(approvalToken, { resolve, timer });
