@@ -31,6 +31,18 @@ function esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function humanText(v, fallback = '未提供') {
+  if (v === undefined || v === null) return fallback;
+  if (typeof v === 'string') return v || fallback;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  try {
+    const s = JSON.stringify(v);
+    return (s && s !== '{}' && s !== '[]') ? s : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function unwrapRpc(res) {
   if (!res || typeof res !== 'object') return null;
   const inner = res.result && typeof res.result === 'object' ? res.result : res;
@@ -58,8 +70,11 @@ export function apply(ctx, config = {}) {
   let polling = false;
   const startTime = Math.floor(Date.now() / 1000);
   const pendingApprovals = new Map();
+  const sessionMeta = new Map(); // sid -> { kind, label, task, lastResult, parentSessionId, childIndex }
+  const childCounters = new Map(); // parentSessionId -> count
 
   const notify = {
+    start: config.notifyStart !== false,
     complete: config.notifyComplete !== false,
     error: config.notifyError !== false,
     approval: config.notifyApproval !== false,
@@ -320,6 +335,40 @@ export function apply(ctx, config = {}) {
     return `📊 DeepSeek 余额\n${lines.join('\n')}\n可用：${data.is_available ? '✅' : '❌'}`;
   };
 
+  const ensureMeta = (session) => {
+    const sid = sessionIdOf(session);
+    if (!sid) return null;
+    let meta = sessionMeta.get(sid);
+    if (!meta) {
+      const isSub = session?.header?.origin === 'subagent';
+      const parent = session?.header?.parentSession;
+      let childIndex = null;
+      if (isSub && parent) {
+        childIndex = (childCounters.get(parent) || 0) + 1;
+        childCounters.set(parent, childIndex);
+      }
+      meta = {
+        kind: isSub ? 'subagent' : 'main',
+        label: '',
+        task: '',
+        lastResult: '',
+        parentSessionId: parent || '',
+        childIndex,
+      };
+      sessionMeta.set(sid, meta);
+    }
+    return meta;
+  };
+
+  const getAgentLabel = (meta) => {
+    if (!meta || meta.kind !== 'subagent') return '🤖 主 Agent';
+    const base = meta.childIndex ? `🧩 子 Agent #${meta.childIndex}` : '🧩 子 Agent';
+    return meta.label ? `${base} · ${humanText(meta.label)}` : base;
+  };
+
+  const taskNameOf = (meta) => humanText(meta?.task, '未提供任务名称');
+  const resultSummaryOf = (meta) => humanText(meta?.lastResult, '未提供结果摘要');
+
   async function ensureChatSession() {
     if (apiRef && chatSessionId && chatSessionReady) return chatSessionId;
     if (!apiRef) throw new Error('DSH apiProxy 不可用');
@@ -410,11 +459,11 @@ export function apply(ctx, config = {}) {
     if (text === '/notify' || text.startsWith('/notify ')) {
       const arg = text.replace('/notify', '').trim().toLowerCase();
       if (arg === 'on') {
-        notify.complete = notify.error = notify.approval = notify.progress = true;
+        notify.start = notify.complete = notify.error = notify.approval = notify.progress = true;
         saveSettings();
         await send('🔔 <b>已开启全部通知。</b>');
       } else if (arg === 'off') {
-        notify.complete = notify.error = notify.approval = notify.progress = false;
+        notify.start = notify.complete = notify.error = notify.approval = notify.progress = false;
         saveSettings();
         await send('🔕 <b>已关闭全部通知。</b>');
       } else if (arg === 'status' || arg === '') {
@@ -505,12 +554,12 @@ export function apply(ctx, config = {}) {
         await answerCallback(cq.id, '余额');
         await send(await getBalanceText(), chatId, { reply_markup: getMenuMarkup() });
       } else if (key === 'notify-on') {
-        notify.complete = notify.error = notify.approval = notify.progress = true;
+        notify.start = notify.complete = notify.error = notify.approval = notify.progress = true;
         saveSettings();
         await answerCallback(cq.id, '已开启通知');
         await send('🔔 <b>已开启全部通知。</b>', chatId, { reply_markup: getMenuMarkup() });
       } else if (key === 'notify-off') {
-        notify.complete = notify.error = notify.approval = notify.progress = false;
+        notify.start = notify.complete = notify.error = notify.approval = notify.progress = false;
         saveSettings();
         await answerCallback(cq.id, '已关闭通知');
         await send('🔕 <b>已关闭全部通知。</b>', chatId, { reply_markup: getMenuMarkup() });
@@ -574,18 +623,45 @@ export function apply(ctx, config = {}) {
   function onEvent(session, event) {
     if (!event || typeof event !== 'object' || typeof event.type !== 'string') return;
     const sid = sessionIdOf(session);
+    const meta = ensureMeta(session);
 
     try {
       if (event.type === 'turn/start') {
         status.busy = true;
         status.currentTool = '';
+        if (sid && sid !== chatSessionId && notify.start) {
+          const label = getAgentLabel(meta);
+          const task = meta?.task ? `\n任务：${esc(humanText(meta.task))}` : '';
+          sendSoon(`🚀 ${label} · 开始工作${task}\n${sid ? `会话：<code>${esc(sid)}</code>` : ''}`);
+        }
+        return;
+      }
+
+      if (event.type === 'subagent/descriptor') {
+        if (meta) {
+          meta.kind = 'subagent';
+          meta.label = humanText(event.data?.label || event.data?.provider || '');
+          if (session?.header?.parentSession) meta.parentSessionId = String(session.header.parentSession);
+        }
+        return;
+      }
+
+      if (event.type === 'assistant/message') {
+        if (meta) {
+          const content = event.data?.message?.content ?? [];
+          const texts = content.filter(c => c?.type === 'text').map(c => c.text).filter(Boolean);
+          if (texts.length > 0) meta.lastResult = texts.join('\n');
+        }
         return;
       }
 
       if (event.type === 'todo/write') {
         const todos = Array.isArray(event.data?.todos) ? event.data.todos : [];
         const current = todos.find(t => t?.status === 'in_progress') || todos.find(t => t?.status === 'pending');
-        if (current?.content) status.task = String(current.content);
+        if (current?.content) {
+          if (meta) meta.task = String(current.content);
+          status.task = String(current.content);
+        }
         if (notify.progress) {
           const done = todos.filter(t => t?.status === 'completed').length;
           const total = todos.length;
@@ -613,22 +689,23 @@ export function apply(ctx, config = {}) {
         saveStats();
         if (notify.approval && !telegramApproval) {
           const data = event.data || {};
-          const detail = shortText(data.detail ?? data.reason ?? data.description ?? data.text ?? '');
-          sendSoon(`🔔 <b>需要你批准</b>\n\n${sid ? `会话：<code>${esc(sid)}</code>\n` : ''}${detail ? `详情：${esc(detail)}` : '有一条新的批准请求'}`);
+          const detail = humanText(data.detail ?? data.reason ?? data.description ?? data.text ?? '');
+          sendSoon(`🔔 <b>需要你批准</b>\n\n${sid ? `会话：<code>${esc(sid)}</code>\n` : ''}详情：${esc(detail)}`);
         }
         return;
       }
 
       if (event.type === 'tool/result' && event.data?.error) {
         const err = event.data.error;
-        const code = err?.code ? ` [${esc(err.code)}]` : '';
-        const message = err?.message ?? err?.text ?? shortText(err);
-        const tool = event.data?.name ?? event.data?.tool ?? 'tool';
+        const code = err?.code ? ` [${esc(humanText(err.code))}]` : '';
+        const message = humanText(err?.message ?? err?.text ?? err, '未知错误');
+        const tool = humanText(event.data?.name ?? event.data?.tool ?? 'tool', 'tool');
         status.lastError = `${tool}: ${message}`;
         stats.errors += 1;
         saveStats();
         if (notify.error) {
-          sendSoon(`❌ <b>工具出错</b>${code}\n\n工具：<code>${esc(tool)}</code>\n错误：${esc(message)}\n${sid ? `会话：<code>${esc(sid)}</code>` : ''}`);
+          const label = getAgentLabel(meta);
+          sendSoon(`❌ <b>工具出错</b>${code}\n\n${label}\n工具：<code>${esc(tool)}</code>\n错误：${esc(message)}\n${sid ? `会话：<code>${esc(sid)}</code>` : ''}`);
         }
         return;
       }
@@ -641,9 +718,11 @@ export function apply(ctx, config = {}) {
         stats.completedTasks += 1;
         saveStats();
         if (notify.complete) {
-          const data = event.data || {};
-          const reason = data.reason ? `（${esc(data.reason)}）` : '';
-          sendSoon(`✅ <b>工作完成</b>${reason}\n\n${sid ? `会话：<code>${esc(sid)}</code>` : ''}`);
+          const label = getAgentLabel(meta);
+          const task = taskNameOf(meta);
+          const result = resultSummaryOf(meta);
+          const parentLine = meta?.parentSessionId ? `\n父任务：<code>${esc(meta.parentSessionId)}</code>` : '';
+          sendSoon(`✅ ${label} · 工作完成\n任务：${esc(task)}\n结果：${esc(result)}\n会话：<code>${esc(sid)}</code>${parentLine}`);
         }
         return;
       }
