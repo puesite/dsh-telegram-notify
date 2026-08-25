@@ -11,6 +11,7 @@
         telegramApproval: true
         dailyReport: true
         dailyReportTime: "23:30"
+        notifyStart: true
         notifyApproval: true
         notifyComplete: true
         notifyError: true
