@@ -62,6 +62,7 @@ export function apply(ctx, config = {}) {
   }
 
   let apiRef = null;
+  let modelServiceRef = null;
   let chatSessionId = null;
   let chatSessionReady = false;
   let chatBusy = false;
@@ -396,6 +397,78 @@ export function apply(ctx, config = {}) {
     return active;
   };
 
+  const summarizeTask = async (sid, meta) => {
+    try {
+      const taskRaw = humanText(meta?.task, '');
+      const resultRaw = humanText(meta?.lastResult, '');
+      if (!taskRaw && !resultRaw) return null;
+      if (!ctx.llm || typeof ctx.llm.stream !== 'function') return null;
+
+      let provider = config.summaryProvider;
+      let model = config.summaryModel;
+      if ((!provider || !model) && modelServiceRef && typeof modelServiceRef.currentSelection === 'function') {
+        const sel = modelServiceRef.currentSelection();
+        if (sel && typeof sel.provider === 'string' && typeof sel.model === 'string') {
+          provider = provider || sel.provider;
+          model = model || sel.model;
+        }
+      }
+      if (!provider || !model) return null;
+
+      const input = [
+        taskRaw ? `任务上下文：${taskRaw}` : '',
+        resultRaw ? `结果上下文：${resultRaw}` : '',
+        `会话：${sid}`,
+      ].filter(Boolean).join('\n');
+
+      const system = [
+        '你是 DSH 工作通知摘要助手。',
+        '根据上下文生成简洁、人类可读的任务名称和结果摘要。',
+        '严格按以下两行输出，不要多余内容、不要引号：',
+        '任务：<20字以内>',
+        '结果：<50字以内>',
+      ].join('\n');
+
+      const messages = [{
+        role: 'user',
+        content: [{ type: 'text', text: `请总结以下工作：\n${input}` }],
+      }];
+
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 10000);
+      let text = '';
+      try {
+        for await (const chunk of ctx.llm.stream({
+          provider,
+          model,
+          messages,
+          system,
+          maxTokens: 120,
+          sessionId: sid,
+          purpose: 'telegram-notify-summary',
+          signal: ac.signal,
+        })) {
+          if (chunk?.type === 'text-delta') text += chunk.text || '';
+          if (chunk?.type === 'finish') break;
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+
+      const taskMatch = text.match(/任务[：:]\s*(.+)/);
+      const resultMatch = text.match(/结果[：:]\s*(.+)/);
+      const task = taskMatch ? taskMatch[1].trim() : '';
+      const result = resultMatch ? resultMatch[1].trim() : '';
+      if (!task && !result) return null;
+      return {
+        task: task || humanText(meta?.task, '未提供任务名称'),
+        result: result || humanText(meta?.lastResult, '未提供结果摘要'),
+      };
+    } catch {
+      return null;
+    }
+  };
+
   async function ensureChatSession() {
     if (apiRef && chatSessionId && chatSessionReady) return chatSessionId;
     if (!apiRef) throw new Error('DSH apiProxy 不可用');
@@ -647,7 +720,7 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  function onEvent(session, event) {
+  async function onEvent(session, event) {
     if (!event || typeof event !== 'object' || typeof event.type !== 'string') return;
     const sid = sessionIdOf(session);
     const meta = ensureMeta(session);
@@ -758,8 +831,9 @@ export function apply(ctx, config = {}) {
         saveStats();
         if (notify.complete) {
           const label = getAgentLabel(meta);
-          const task = taskNameOf(meta);
-          const result = resultSummaryOf(meta);
+          const summary = await summarizeTask(sid, meta);
+          const task = summary?.task || taskNameOf(meta);
+          const result = summary?.result || resultSummaryOf(meta);
           const parentLine = meta?.parentSessionId ? `\n父任务：<code>${esc(meta.parentSessionId)}</code>` : '';
           sendSoon(`✅ ${label} · 工作完成\n任务：${esc(task)}\n结果：${esc(result)}\n会话：<code>${esc(sid)}</code>${parentLine}`);
         }
@@ -805,8 +879,9 @@ export function apply(ctx, config = {}) {
   }
 
   if (chatEnabled && typeof ctx.inject === 'function') {
-    ctx.inject(['apiProxy'], (apiCtx) => {
+    ctx.inject(['apiProxy', 'agentDefaultModel'], (apiCtx) => {
       apiRef = apiCtx.get('apiProxy') ?? null;
+      modelServiceRef = apiCtx.get('agentDefaultModel') ?? null;
       if (!apiRef) {
         ctx.logger?.warn?.('[dsh-telegram-notify] apiProxy not injectable, chat disabled');
         return;
