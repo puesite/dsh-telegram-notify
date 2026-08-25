@@ -219,13 +219,21 @@ export function apply(ctx, config = {}) {
   };
 
   const getStatusText = () => {
+    const active = [...sessionMeta.entries()].filter(([sid, m]) => sid !== chatSessionId && m.busy);
     const lines = [];
-    lines.push(status.busy ? '🟡 <b>DSH 正在工作中…</b>' : '🟢 <b>DSH 当前空闲</b>');
-    if (status.task) lines.push(`📋 当前任务：${esc(shortText(status.task, 200))}`);
-    if (status.currentTool) lines.push(`🔧 当前工具：<code>${esc(status.currentTool)}</code>`);
+    lines.push(active.length > 0 ? `🟡 <b>DSH 正在工作中…（${active.length} 个任务）</b>` : '🟢 <b>DSH 当前空闲</b>');
+    if (active.length > 0) {
+      active.forEach(([sid, m], idx) => {
+        const label = getAgentLabel(m);
+        const task = humanText(m.task, '未提供任务名称');
+        const tool = m.currentTool ? ` · <code>${esc(m.currentTool)}</code>` : '';
+        lines.push(`${idx + 1}. ${label} · ${esc(shortText(task, 120))}${tool}`);
+        lines.push(`   会话：<code>${esc(sid)}</code>`);
+      });
+    }
     lines.push(`⏱️ 最近完成：<code>${esc(fmtTime(status.lastCompletedAt))}</code>`);
     if (status.lastError) lines.push(`❌ 最近错误：${esc(shortText(status.lastError, 200))}`);
-    lines.push(`🔔 通知状态：完成=${notify.complete ? '✅' : '❌'}，错误=${notify.error ? '✅' : '❌'}，批准=${notify.approval ? '✅' : '❌'}，进度=${notify.progress ? '✅' : '❌'}`);
+    lines.push(`🔔 通知状态：开始=${notify.start ? '✅' : '❌'}，完成=${notify.complete ? '✅' : '❌'}，错误=${notify.error ? '✅' : '❌'}，批准=${notify.approval ? '✅' : '❌'}，进度=${notify.progress ? '✅' : '❌'}`);
     return lines.join('\n');
   };
 
@@ -351,9 +359,11 @@ export function apply(ctx, config = {}) {
         kind: isSub ? 'subagent' : 'main',
         label: '',
         task: '',
+        currentTool: '',
         lastResult: '',
         parentSessionId: parent || '',
         childIndex,
+        busy: false,
       };
       sessionMeta.set(sid, meta);
     }
@@ -368,6 +378,23 @@ export function apply(ctx, config = {}) {
 
   const taskNameOf = (meta) => humanText(meta?.task, '未提供任务名称');
   const resultSummaryOf = (meta) => humanText(meta?.lastResult, '未提供结果摘要');
+
+  const recomputeBusy = () => {
+    const active = [...sessionMeta.entries()].filter(([sid, m]) => sid !== chatSessionId && m.busy);
+    status.busy = active.length > 0;
+    if (active.length === 0) {
+      status.task = '';
+      status.currentTool = '';
+    } else if (active.length === 1) {
+      const [, m] = active[0];
+      status.task = m.task || status.task;
+      status.currentTool = m.currentTool || '';
+    } else {
+      status.task = `${active.length} 个任务并行中`;
+      status.currentTool = '';
+    }
+    return active;
+  };
 
   async function ensureChatSession() {
     if (apiRef && chatSessionId && chatSessionReady) return chatSessionId;
@@ -627,8 +654,8 @@ export function apply(ctx, config = {}) {
 
     try {
       if (event.type === 'turn/start') {
-        status.busy = true;
-        status.currentTool = '';
+        if (meta) meta.busy = true;
+        recomputeBusy();
         if (sid && sid !== chatSessionId && notify.start) {
           const label = getAgentLabel(meta);
           const task = meta?.task ? `\n任务：${esc(humanText(meta.task))}` : '';
@@ -659,8 +686,12 @@ export function apply(ctx, config = {}) {
         const todos = Array.isArray(event.data?.todos) ? event.data.todos : [];
         const current = todos.find(t => t?.status === 'in_progress') || todos.find(t => t?.status === 'pending');
         if (current?.content) {
-          if (meta) meta.task = String(current.content);
-          status.task = String(current.content);
+          if (meta) {
+            meta.task = String(current.content);
+            recomputeBusy();
+          } else {
+            status.task = String(current.content);
+          }
         }
         if (notify.progress) {
           const done = todos.filter(t => t?.status === 'completed').length;
@@ -671,14 +702,21 @@ export function apply(ctx, config = {}) {
       }
 
       if (event.type === 'tool/call') {
-        status.currentTool = event.data?.name ?? event.data?.tool ?? 'tool';
+        const toolName = event.data?.name ?? event.data?.tool ?? 'tool';
+        if (meta) {
+          meta.currentTool = toolName;
+          recomputeBusy();
+        } else {
+          status.currentTool = toolName;
+        }
         stats.toolCalls += 1;
         saveStats();
         return;
       }
 
       if (event.type === 'turn/end' && sid === chatSessionId && chatBusy) {
-        status.busy = false;
+        if (meta) meta.busy = false;
+        recomputeBusy();
         status.lastCompletedAt = Date.now();
         void sendChatReply();
         return;
@@ -711,7 +749,8 @@ export function apply(ctx, config = {}) {
       }
 
       if (event.type === 'turn/end') {
-        status.busy = false;
+        if (meta) meta.busy = false;
+        recomputeBusy();
         status.lastCompletedAt = Date.now();
         status.lastCompletedSession = sid;
         if (sid === chatSessionId) return;
