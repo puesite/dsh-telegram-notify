@@ -4,7 +4,7 @@
 
 **让 DeepSeek Harness / EAC 通过 Telegram 通知你、陪你聊天、让你远程批准**
 
-![Version](https://img.shields.io/badge/version-0.4.1-blue)
+![Version](https://img.shields.io/badge/version-0.5.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![DSH](https://img.shields.io/badge/DSH-Plugin-orange)
 ![Telegram](https://img.shields.io/badge/Telegram-Bot-2CA5E0)
@@ -159,6 +159,7 @@ dsh-telegram-notify/
 ```
 
 > 如果任务名称或结果摘要缺失，会显示“未提供任务名称”/“未提供结果摘要”，不会出现 `[object Object]`。
+> 插件会自动调用当前模型，根据上下文生成更简洁、更人类可读的任务名称和结果摘要。
 
 
 ## 🔒 安全说明
