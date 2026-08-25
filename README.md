@@ -4,7 +4,7 @@
 
 **让 DeepSeek Harness / EAC 通过 Telegram 通知你、陪你聊天、让你远程批准**
 
-![Version](https://img.shields.io/badge/version-0.4.0-blue)
+![Version](https://img.shields.io/badge/version-0.4.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![DSH](https://img.shields.io/badge/DSH-Plugin-orange)
 ![Telegram](https://img.shields.io/badge/Telegram-Bot-2CA5E0)
