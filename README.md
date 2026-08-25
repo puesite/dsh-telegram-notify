@@ -4,7 +4,7 @@
 
 **让 DeepSeek Harness / EAC 通过 Telegram 通知你、陪你聊天、让你远程批准**
 
-![Version](https://img.shields.io/badge/version-0.3.0-blue)
+![Version](https://img.shields.io/badge/version-0.4.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![DSH](https://img.shields.io/badge/DSH-Plugin-orange)
 ![Telegram](https://img.shields.io/badge/Telegram-Bot-2CA5E0)
@@ -120,6 +120,46 @@ dsh-telegram-notify/
 - 📋 进度更新（默认关闭，可在配置里打开）
 
 ---
+
+## 📨 通知格式
+
+### 主 Agent 开始工作
+
+```text
+🚀 🤖 主 Agent · 开始工作
+任务：<任务名称>
+会话：<session_id>
+```
+
+### 子 Agent 开始工作
+
+```text
+🚀 🧩 子 Agent #1 · 开始工作
+任务：<子任务名称>
+会话：<session_id>
+```
+
+### 主 Agent 完成
+
+```text
+✅ 🤖 主 Agent · 工作完成
+任务：<任务名称>
+结果：<简短结果摘要>
+会话：<session_id>
+```
+
+### 子 Agent 完成
+
+```text
+✅ 🧩 子 Agent #1 · 工作完成
+任务：<子任务名称>
+结果：<简短结果摘要>
+会话：<session_id>
+父任务：<parent_session_id>
+```
+
+> 如果任务名称或结果摘要缺失，会显示“未提供任务名称”/“未提供结果摘要”，不会出现 `[object Object]`。
+
 
 ## 🔒 安全说明
 
